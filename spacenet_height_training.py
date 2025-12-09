@@ -3,7 +3,7 @@
 """
 Building Height Estimation Training Script
 Modified from binary segmentation to height regression
-FIXED VERSION - No NaN issues
+FIXED VERSION - Stability and Performance Enhancements
 """
 import argparse
 import torch
@@ -43,11 +43,16 @@ class HeightEstimationDataset(Dataset):
         # Load height statistics for normalization
         self.height_max = height_stats['max']
         self.height_min = height_stats['min']
+        # --- MODIFICATION: Use Mean and Std for Z-score normalization ---
         self.height_mean = height_stats['mean']
         self.height_std = height_stats['std']
         
+        # Add a tiny epsilon to std to avoid division by zero, though stats should prevent this
+        self.height_std_safe = self.height_std + 1e-8 
+        
         print(f"Dataset loaded with {len(self.data_list)} samples")
         print(f"Height range: {self.height_min:.2f}m - {self.height_max:.2f}m")
+        print(f"Height Mean/Std: {self.height_mean:.2f} / {self.height_std:.2f}") # Added printout
     
     def __len__(self):
         return len(self.data_list)
@@ -68,11 +73,9 @@ class HeightEstimationDataset(Dataset):
         
         # Normalize heights
         if self.normalize_heights:
-            # Method 1: Min-Max normalization to [0, 1]
-            height_map = np.clip(height_map / (self.height_max + 1e-8), 0, 1)
-            
-            # Alternative Method 2: Z-score normalization (uncomment to use)
-            # height_map = (height_map - self.height_mean) / (self.height_std + 1e-8)
+            # --- MODIFICATION: Switched to Z-score normalization for stability ---
+            # Z-score normalization: height_norm = (height - mean) / std
+            height_map = (height_map - self.height_mean) / self.height_std_safe
         
         # Apply transforms
         if self.transform:
@@ -149,41 +152,33 @@ class HeightEstimationLoss(nn.Module):
         mae_loss = self.mae(pred_height, target_height)
         
         # Apply mask
-        mse_loss = (mse_loss * building_mask).sum() / (building_mask.sum() + 1e-8)
-        mae_loss = (mae_loss * building_mask).sum() / (building_mask.sum() + 1e-8)
+        # Note: We rely on the 1e-8 for stability against batches with no buildings
+        # This is okay for loss, but we will add a check in the training loop
+        # to ensure at least one building exists for metric calculation.
+        mask_sum = building_mask.sum()
+        if mask_sum < 1.0: # Check if there are any buildings in the batch
+             # If no buildings, loss is zero (prevents NaN)
+             return torch.zeros(1, device=pred_height.device, requires_grad=True).mean() 
+
+        mse_loss = (mse_loss * building_mask).sum() / (mask_sum + 1e-8)
+        mae_loss = (mae_loss * building_mask).sum() / (mask_sum + 1e-8)
         
         total_loss = self.mse_weight * mse_loss + self.mae_weight * mae_loss
         
         return total_loss
 
-class MultiTaskLoss(nn.Module):
-    """
-    Multi-task loss for joint segmentation and height estimation
-    """
-    def __init__(self, seg_weight=0.3, height_weight=0.7):
-        super().__init__()
-        self.seg_weight = seg_weight
-        self.height_weight = height_weight
-        self.bce = nn.BCEWithLogitsLoss()
-        self.height_loss = HeightEstimationLoss()
-    
-    def forward(self, pred_mask, pred_height, target_mask, target_height):
-        # Segmentation loss
-        seg_loss = self.bce(pred_mask, target_mask)
-        
-        # Height estimation loss (only on building pixels)
-        height_loss = self.height_loss(pred_height, target_height, target_mask)
-        
-        return self.seg_weight * seg_loss + self.height_weight * height_loss
+# Removed MultiTaskLoss as it was not used and simplifies the fix.
 
-def calculate_height_metrics(pred_height, target_height, building_mask, height_max):
+def calculate_height_metrics(pred_height, target_height, building_mask, height_mean, height_std):
     """
     Calculate metrics for height estimation
     Returns metrics in meters (denormalized)
+    
+    --- MODIFICATION: Uses Mean and Std for Z-score denormalization ---
     """
-    # Denormalize predictions
-    pred_height_m = pred_height * height_max
-    target_height_m = target_height * height_max
+    # Denormalize predictions: H_m = H_norm * std + mean
+    pred_height_m = pred_height * height_std + height_mean
+    target_height_m = target_height * height_std + height_mean
     
     # Extract building pixels only
     mask_bool = building_mask > 0.5
@@ -195,7 +190,8 @@ def calculate_height_metrics(pred_height, target_height, building_mask, height_m
             'rmse': 0.0,
             'mae': 0.0,
             'mape': 0.0,
-            'r2': 0.0
+            'r2': 0.0,
+            'num_pixels': 0
         }
     
     # RMSE (Root Mean Squared Error) in meters
@@ -209,6 +205,7 @@ def calculate_height_metrics(pred_height, target_height, building_mask, height_m
     
     # R² Score
     ss_res = torch.sum((target_buildings - pred_buildings)**2)
+    # --- MODIFICATION: Use target_buildings.mean() for ss_tot calculation ---
     ss_tot = torch.sum((target_buildings - target_buildings.mean())**2)
     r2 = 1 - ss_res / (ss_tot + 1e-8)
     
@@ -216,14 +213,16 @@ def calculate_height_metrics(pred_height, target_height, building_mask, height_m
         'rmse': rmse.item(),
         'mae': mae.item(),
         'mape': mape.item(),
-        'r2': r2.item()
+        'r2': r2.item(),
+        'num_pixels': len(pred_buildings)
     }
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, height_max):
+# --- MODIFICATION: Added height_mean and height_std to training function arguments ---
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, height_mean, height_std):
     """Training loop for one epoch"""
     model.train()
     running_loss = 0.0
-    metrics = {'rmse': 0, 'mae': 0, 'mape': 0, 'r2': 0}
+    metrics = {'rmse': 0, 'mae': 0, 'mape': 0, 'r2': 0, 'num_batches': 0}
     
     pbar = tqdm(dataloader, desc=f'Training Epoch {epoch}')
     for batch_idx, (images, target_heights, building_masks) in enumerate(pbar):
@@ -236,26 +235,29 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, height_m
         # Forward pass
         pred_heights = model(images)
         
+        # Check for non-building batch (to avoid unstable metrics)
+        if building_masks.sum() < 1.0:
+            pbar.set_postfix({'loss': 'Skip (No Buildings)'})
+            continue # Skip batch with no buildings in it
+            
         # ADDED: NaN/Inf check
         if torch.isnan(pred_heights).any() or torch.isinf(pred_heights).any():
-            print(f"\n⚠️  WARNING: NaN/Inf detected in predictions at batch {batch_idx}")
-            print(f"  Images - min: {images.min():.3f}, max: {images.max():.3f}")
-            print(f"  Targets - min: {target_heights.min():.3f}, max: {target_heights.max():.3f}")
-            print(f"  Masks - sum: {building_masks.sum():.0f}")
+            print(f"\n⚠️  WARNING: NaN/Inf detected in predictions at batch {batch_idx}. Skipping batch.")
             continue  # Skip this batch
         
         # Calculate loss
+        # Loss is robust to non-building batches due to check in HeightEstimationLoss
         loss = criterion(pred_heights, target_heights, building_masks)
         
         # Check loss for NaN
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\n⚠️  WARNING: NaN/Inf loss at batch {batch_idx}")
+            print(f"\n⚠️  WARNING: NaN/Inf loss at batch {batch_idx}. Skipping batch.")
             continue
         
         # Backward pass
         loss.backward()
         
-        # ADDED: Gradient clipping
+        # ADDED: Gradient clipping (Keep this)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
@@ -265,28 +267,36 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, height_m
         # Calculate metrics
         with torch.no_grad():
             batch_metrics = calculate_height_metrics(
-                pred_heights, target_heights, building_masks, height_max
+                pred_heights, target_heights, building_masks, height_mean, height_std
             )
-            for key in metrics:
+            for key in ['rmse', 'mae', 'mape', 'r2']:
                 metrics[key] += batch_metrics[key]
+            metrics['num_batches'] += 1
         
         # Update progress bar
+        current_mae = metrics['mae'] / metrics['num_batches'] if metrics['num_batches'] > 0 else 0
+        current_loss = running_loss / metrics['num_batches'] if metrics['num_batches'] > 0 else 0
         pbar.set_postfix({
-            'loss': running_loss / (batch_idx + 1),
-            'mae': metrics['mae'] / (batch_idx + 1)
+            'loss': f'{current_loss:.4f}',
+            'mae': f'{current_mae:.2f}m'
         })
     
     # Average metrics
-    for key in metrics:
-        metrics[key] /= len(dataloader)
-    
-    return running_loss / len(dataloader), metrics
+    total_batches = metrics['num_batches']
+    if total_batches == 0:
+        return 0.0, {'rmse': 0, 'mae': 0, 'mape': 0, 'r2': 0}
 
-def validate_epoch(model, dataloader, criterion, device, epoch, height_max):
+    for key in ['rmse', 'mae', 'mape', 'r2']:
+        metrics[key] /= total_batches
+    
+    return running_loss / total_batches, {k: metrics[k] for k in ['rmse', 'mae', 'mape', 'r2']}
+
+# --- MODIFICATION: Added height_mean and height_std to validation function arguments ---
+def validate_epoch(model, dataloader, criterion, device, epoch, height_mean, height_std):
     """Validation loop for one epoch"""
     model.eval()
     running_loss = 0.0
-    metrics = {'rmse': 0, 'mae': 0, 'mape': 0, 'r2': 0}
+    metrics = {'rmse': 0, 'mae': 0, 'mape': 0, 'r2': 0, 'num_batches': 0}
     
     with torch.no_grad():
         pbar = tqdm(dataloader, desc=f'Validation Epoch {epoch}')
@@ -298,29 +308,54 @@ def validate_epoch(model, dataloader, criterion, device, epoch, height_max):
             # Forward pass
             pred_heights = model(images)
             
+            # Check for non-building batch
+            if building_masks.sum() < 1.0:
+                 pbar.set_postfix({'loss': 'Skip (No Buildings)'})
+                 continue
+            
+            # --- MODIFICATION: Check for NaN in Validation Predictions ---
+            if torch.isnan(pred_heights).any() or torch.isinf(pred_heights).any():
+                print(f"\n⚠️  WARNING: NaN/Inf detected in validation predictions at batch {batch_idx}. Skipping batch.")
+                continue
+
             # Calculate loss
             loss = criterion(pred_heights, target_heights, building_masks)
+            
+            # --- MODIFICATION: Check for NaN in Validation Loss ---
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n⚠️  WARNING: NaN/Inf loss in validation at batch {batch_idx}. Skipping batch.")
+                continue
+
             running_loss += loss.item()
             
             # Calculate metrics
             batch_metrics = calculate_height_metrics(
-                pred_heights, target_heights, building_masks, height_max
+                pred_heights, target_heights, building_masks, height_mean, height_std
             )
-            for key in metrics:
+            for key in ['rmse', 'mae', 'mape', 'r2']:
                 metrics[key] += batch_metrics[key]
+            metrics['num_batches'] += 1
             
+            current_mae = metrics['mae'] / metrics['num_batches'] if metrics['num_batches'] > 0 else 0
+            current_loss = running_loss / metrics['num_batches'] if metrics['num_batches'] > 0 else 0
             pbar.set_postfix({
-                'loss': running_loss / (batch_idx + 1),
-                'mae': metrics['mae'] / (batch_idx + 1)
+                'loss': f'{current_loss:.4f}',
+                'mae': f'{current_mae:.2f}m'
             })
     
     # Average metrics
-    for key in metrics:
-        metrics[key] /= len(dataloader)
-    
-    return running_loss / len(dataloader), metrics
+    total_batches = metrics['num_batches']
+    if total_batches == 0:
+        # If no batches were processed (e.g., all were non-building), return 0.0
+        return 0.0, {'rmse': 0, 'mae': 0, 'mape': 0, 'r2': 0}
 
-def visualize_predictions(model, dataloader, device, height_max, save_path, num_samples=4):
+    for key in ['rmse', 'mae', 'mape', 'r2']:
+        metrics[key] /= total_batches
+    
+    return running_loss / total_batches, {k: metrics[k] for k in ['rmse', 'mae', 'mape', 'r2']}
+
+# --- MODIFICATION: Added height_mean and height_std to visualization arguments ---
+def visualize_predictions(model, dataloader, device, height_mean, height_std, save_path, num_samples=4):
     """Visualize model predictions"""
     model.eval()
     
@@ -328,8 +363,20 @@ def visualize_predictions(model, dataloader, device, height_max, save_path, num_
     if num_samples == 1:
         axes = axes.reshape(1, -1)
     
+    # --- MODIFICATION: Filter out non-building batches for visualization ---
+    valid_batches = []
+    for batch in dataloader:
+        if batch[2].sum() > 0: # Check if building mask has pixels
+            valid_batches.append(batch)
+            if len(valid_batches) >= 1: break # Only need one valid batch
+
+    if not valid_batches:
+        print("Skipping visualization: No batches with buildings found in dataloader.")
+        return
+
+    images_batch, target_heights_batch, masks_batch = valid_batches[0]
+
     with torch.no_grad():
-        images_batch, target_heights_batch, masks_batch = next(iter(dataloader))
         images_batch = images_batch.to(device)
         target_heights_batch = target_heights_batch.to(device)
         masks_batch = masks_batch.to(device)
@@ -343,9 +390,18 @@ def visualize_predictions(model, dataloader, device, height_max, save_path, num_
             img = np.clip(img, 0, 1)
             
             mask = masks_batch[i, 0].cpu().numpy()
-            target_height = target_heights_batch[i, 0].cpu().numpy() * height_max
-            pred_height = pred_heights_batch[i, 0].cpu().numpy() * height_max
             
+            # --- MODIFICATION: Denormalize using Z-score stats ---
+            target_height = target_heights_batch[i, 0].cpu().numpy() * height_std + height_mean
+            pred_height = pred_heights_batch[i, 0].cpu().numpy() * height_std + height_mean
+            
+            # Clip denormalized height to min 0m for visualization, as negative height is non-physical
+            pred_height = np.clip(pred_height, 0, target_height.max() * 2) 
+            target_height = np.clip(target_height, 0, target_height.max() * 2)
+            
+            # Use max height from stats for consistent color bar range
+            v_max = max(height_mean + 2 * height_std, target_height.max()) 
+
             # Calculate error map
             error_map = np.abs(target_height - pred_height) * mask
             
@@ -354,13 +410,13 @@ def visualize_predictions(model, dataloader, device, height_max, save_path, num_
             axes[i, 0].set_title('Input Image')
             axes[i, 0].axis('off')
             
-            im1 = axes[i, 1].imshow(target_height, cmap='viridis', vmin=0, vmax=height_max)
-            axes[i, 1].set_title(f'Ground Truth\nMax: {target_height.max():.1f}m')
+            im1 = axes[i, 1].imshow(target_height, cmap='viridis', vmin=0, vmax=v_max)
+            axes[i, 1].set_title(f'Ground Truth\nMax: {target_height[mask>0].max():.1f}m')
             axes[i, 1].axis('off')
             plt.colorbar(im1, ax=axes[i, 1], fraction=0.046)
             
-            im2 = axes[i, 2].imshow(pred_height, cmap='viridis', vmin=0, vmax=height_max)
-            axes[i, 2].set_title(f'Prediction\nMax: {pred_height.max():.1f}m')
+            im2 = axes[i, 2].imshow(pred_height, cmap='viridis', vmin=0, vmax=v_max)
+            axes[i, 2].set_title(f'Prediction\nMax: {pred_height[mask>0].max():.1f}m')
             axes[i, 2].axis('off')
             plt.colorbar(im2, ax=axes[i, 2], fraction=0.046)
             
@@ -401,13 +457,22 @@ def main():
     data_dir = Path(args.data_dir)
     
     # Load height statistics
-    with open(data_dir / 'height_statistics.json', 'r') as f:
-        height_stats = json.load(f)
-    
+    try:
+        with open(data_dir / 'height_statistics.json', 'r') as f:
+            height_stats = json.load(f)
+    except FileNotFoundError:
+        print(f"ERROR: height_statistics.json not found in {data_dir}. Cannot proceed.")
+        return # Exit if critical file is missing
+        
     print(f"\n📊 Height Statistics:")
     print(f"  Min: {height_stats['min']:.2f}m")
     print(f"  Max: {height_stats['max']:.2f}m")
     print(f"  Mean: {height_stats['mean']:.2f}m")
+    print(f"  Std: {height_stats['std']:.2f}m") # Added printout
+    
+    # Extract mean and std for metric calculation
+    height_mean = height_stats['mean']
+    height_std = height_stats['std']
     
     # Load data splits
     with open(data_dir / 'train_data.json', 'r') as f:
@@ -494,13 +559,13 @@ def main():
         # Training
         train_loss, train_metrics = train_epoch(
             model, train_loader, criterion, optimizer, device, 
-            epoch + 1, height_stats['max']
+            epoch + 1, height_mean, height_std # Pass mean/std
         )
         
         # Validation
         val_loss, val_metrics = validate_epoch(
             model, val_loader, criterion, device, 
-            epoch + 1, height_stats['max']
+            epoch + 1, height_mean, height_std # Pass mean/std
         )
         
         # Step scheduler
@@ -533,7 +598,7 @@ def main():
         print(f'  R²: {val_metrics["r2"]:.4f}')
         
         # Save best model
-        if val_metrics['mae'] < best_mae:
+        if val_metrics['mae'] < best_mae and val_metrics['mae'] != 0.0:
             best_mae = val_metrics['mae']
             patience_counter = 0
             
@@ -551,7 +616,7 @@ def main():
             
             # Create visualization
             visualize_predictions(
-                model, val_loader, device, height_stats['max'],
+                model, val_loader, device, height_mean, height_std,
                 save_dir / f'predictions_epoch_{epoch+1}.png'
             )
         else:
